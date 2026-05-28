@@ -317,40 +317,293 @@ interface.launch()
 
 ## Rancangan Eksperimen
 
-### Baseline yang Dibandingkan
+Seluruh eksperimen diorganisasi dalam tiga kelompok utama ditambah satu analisis post-hoc, dengan total **8 training run** dan **1 analisis interpretability**. Semua run menggunakan 5-fold cross-validation dengan stratified sampling.
 
-Model CRISPR-MTL dibandingkan dengan empat konfigurasi baseline dalam dua kelompok.
+---
 
-**Kelompok A: Baseline dari Scratch (tanpa pretrained model)**
+### Kelompok 1: Baseline Experiments (Hari 1)
 
-Baseline A1 adalah single-task model BiLSTM dari nol untuk on-target prediction, menggunakan one-hot encoding. Baseline A2 adalah single-task model CNN-BiLSTM dari nol untuk off-target prediction, mengikuti encoding scheme CRISPR-Net. Dua baseline ini mengontrol apakah DNABERT memberikan keunggulan dibanding arsitektur konvensional.
+Tujuan kelompok ini adalah menyediakan angka pembanding yang solid sebelum model utama dilatih. Ada empat run dalam kelompok ini, dibagi menjadi dua sub-kelompok berdasarkan jenis encoder yang digunakan.
 
-**Kelompok B: Baseline DNABERT Single-Task**
+#### Exp-A1: Single-Task BiLSTM dari Scratch (On-Target)
 
-Baseline B1 adalah DNABERT yang di-fine-tune hanya untuk on-target prediction. Baseline B2 adalah DNABERT yang di-fine-tune hanya untuk off-target prediction. Dua baseline ini adalah yang paling penting: jika CRISPR-MTL mengalahkan keduanya, terbukti bahwa multi-task setup memberikan manfaat di atas penggunaan DNABERT itu sendiri.
+```
+Tujuan    : baseline on-target tanpa pretrained model, sebagai lower bound
+Input     : one-hot encoding gRNA 23-mer → shape (23, 4)
+Arsitektur: Linear(4→32) → BiLSTM(hidden=128, layers=2, bidirectional=True)
+            → ambil hidden state terakhir → Linear(256→64) → ReLU
+            → Linear(64→1) → Sigmoid
+Task      : Regression
+Loss      : MSE
+Dataset   : Doench 2016 + DeepHF (~8.000-10.000 sampel)
+Split     : 5-fold cross-validation (80% train, 20% val per fold)
+Optimizer : Adam, lr=1e-3
+Epochs    : 50 (dengan early stopping patience=10)
+Output    : Spearman correlation, Pearson correlation (mean ± std across folds)
+Estimasi  : ~5-10 menit per fold di GPU T4/P100
+```
 
-**Kelompok C: Angka dari Literatur**
+#### Exp-A2: Single-Task CNN-BiLSTM dari Scratch (Off-Target)
 
-Angka yang dilaporkan oleh CRISPRon (on-target) dan CRISPR-DIPOFF serta CRISPR-M (off-target) dikutip langsung dari paper masing-masing untuk memberikan gambaran posisi performa relatif terhadap SOTA yang sudah dipublikasi.
+```
+Tujuan    : baseline off-target tanpa pretrained model, replikasi pendekatan CRISPR-Net
+Input     : mismatch matrix gRNA-DNA pair → shape (23, 7)
+            7 channel: 4 one-hot gRNA + tipe mismatch (match/sub/ins/del)
+Arsitektur: Conv1D(in=7, out=64, kernel=3) → ReLU → MaxPool
+            → BiLSTM(hidden=128, bidirectional=True)
+            → Linear(256→64) → ReLU → Dropout(0.3)
+            → Linear(64→1) → Sigmoid
+Task      : Binary Classification
+Loss      : BCE dengan class weighting (w_pos = n_neg/n_pos)
+Dataset   : GUIDE-seq + CIRCLE-seq + SITE-seq + Digenome-seq
+Split     : 5-fold stratified cross-validation
+Optimizer : Adam, lr=1e-3
+Epochs    : 50 (dengan early stopping patience=10)
+Output    : AUROC, AUPR (mean ± std across folds)
+Estimasi  : ~5-10 menit per fold di GPU T4/P100
+```
 
-### Ablation Study
+#### Exp-B1: DNABERT Single-Task (On-Target)
 
-| Konfigurasi | Perubahan dari Full Model | Pertanyaan yang Dijawab |
-|---|---|---|
-| Full CRISPR-MTL | - | Performa terbaik yang diklaim |
-| DNABERT single-task (B1 dan B2) | Satu head per model | Apakah multi-task membantu? |
-| CNN+BiLSTM dari scratch (A1 dan A2) | Ganti encoder | Apakah DNABERT penting? |
-| Semua DNABERT layer dibekukan | Freeze layer 1-12 | Apakah fine-tuning layer akhir perlu? |
-| Fine-tune layer 1-12 semua | Unfreeze semua | Apakah full fine-tuning malah merugikan? |
-| Combined loss (alpha=0.5) | Ganti alternating dengan combined | Strategi training mana yang lebih stabil? |
+```
+Tujuan    : baseline on-target dengan DNABERT, untuk mengisolasi kontribusi multi-task
+Input     : k-mer tokenized gRNA (6-mer overlapping) → [CLS] + 18 token + [SEP] = 20 token
+Arsitektur: DNABERT pretrained (zhihan1996/DNA_bert_6)
+            Layer 1-8 : FROZEN
+            Layer 9-12: fine-tuned
+            Ambil [CLS] representation (768-dim)
+            → Dropout(0.1) → Linear(768→256) → GELU → LayerNorm (projection)
+            → Linear(256→64) → ReLU → Dropout(0.2) → Linear(64→1) → Sigmoid
+Task      : Regression
+Loss      : MSE
+Dataset   : sama dengan A1
+Split     : 5-fold cross-validation
+Optimizer : AdamW dengan discriminative LR
+            LR projection + head = 1e-4
+            LR DNABERT layer 9-12 = 1e-5
+Epochs    : 30 (DNABERT konvergen lebih cepat dari scratch)
+Output    : Spearman correlation, Pearson correlation (mean ± std across folds)
+Estimasi  : ~15-25 menit per fold di GPU T4/P100
+```
+
+#### Exp-B2: DNABERT Single-Task (Off-Target)
+
+```
+Tujuan    : baseline off-target dengan DNABERT, untuk mengisolasi kontribusi multi-task
+Input     : k-mer pair encoding → [CLS] + 18 gRNA token + [SEP] + 18 DNA token + [SEP] = 38 token
+Arsitektur: DNABERT pretrained (zhihan1996/DNA_bert_6)
+            Layer 1-8 : FROZEN
+            Layer 9-12: fine-tuned
+            Ambil [CLS] representation (768-dim)
+            → Dropout(0.1) → Linear(768→256) → GELU → LayerNorm (projection)
+            → Linear(256→64) → ReLU → Dropout(0.3) → Linear(64→1) → Sigmoid
+Task      : Binary Classification
+Loss      : BCE dengan class weighting
+Dataset   : sama dengan A2
+Split     : 5-fold stratified cross-validation
+Optimizer : AdamW dengan discriminative LR
+            LR projection + head = 1e-4
+            LR DNABERT layer 9-12 = 1e-5
+Epochs    : 30
+Output    : AUROC, AUPR (mean ± std across folds)
+Estimasi  : ~15-25 menit per fold di GPU T4/P100
+```
+
+---
+
+### Kelompok 2: Main Model (Hari 2)
+
+Ini adalah eksperimen inti yang menjadi klaim utama novelty penelitian.
+
+#### Exp-MTL-Full: CRISPR-MTL Full Model
+
+```
+Tujuan    : model utama yang diklaim, membuktikan hipotesis shared representation
+Input     : dua jenis input yang di-batch secara bergantian
+            Batch on-target : [CLS] + 18 gRNA token + [SEP] (panjang 20)
+            Batch off-target: [CLS] + 18 gRNA token + [SEP] + 18 DNA token + [SEP] (panjang 38)
+
+Arsitektur: DNABERT shared encoder (zhihan1996/DNA_bert_6)
+            Layer 1-8 : FROZEN selama Fase 1 dan 2
+            Layer 9-12: frozen selama Fase 1, fine-tuned selama Fase 2
+            → [CLS] token (768-dim)
+            → Dropout(0.1) → Linear(768→256) → GELU → LayerNorm (shared projection)
+            ┌─ Head 1 (On-Target) : Linear(256→64) → ReLU → Dropout(0.2) → Linear(64→1) → Sigmoid
+            └─ Head 2 (Off-Target): Linear(256→64) → ReLU → Dropout(0.3) → Linear(64→1) → Sigmoid
+
+Training  :
+  Fase 1 (Epoch 1-5, Warm-up):
+    - Semua DNABERT layer FROZEN
+    - Hanya projection layer + Head 1 + Head 2 yang dilatih
+    - LR = 1e-4 untuk semua yang tidak dibekukan
+    - Alternating: 1 batch on-target (update projection + Head 1)
+                   1 batch off-target (update projection + Head 2)
+
+  Fase 2 (Epoch 6-30, Full Fine-Tuning):
+    - Layer 9-12 DNABERT di-unfreeze
+    - Discriminative LR:
+        LR DNABERT layer 9-12 = 1e-5
+        LR projection + heads = 1e-4
+    - Alternating training tetap sama seperti Fase 1
+    - Scheduler: ReduceLROnPlateau (patience=5, factor=0.5)
+
+Loss      :
+    Saat batch on-target  : L_on  = MSE(pred_on, true_on)
+    Saat batch off-target : L_off = BCE_weighted(pred_off, true_off)
+    Tidak ada combined loss, setiap step hanya mengoptimasi satu loss
+
+Checkpoint: simpan model terbaik berdasarkan rata-rata (norm_spearman + norm_auroc)
+            di mana kedua metrik dinormalisasi ke range 0-1 terhadap baseline
+
+Split     : 5-fold cross-validation (fold yang sama dengan Baseline)
+Output    : Spearman + Pearson (Head 1), AUROC + AUPR (Head 2)
+Estimasi  : ~30-45 menit per fold di GPU T4/P100
+```
+
+---
+
+### Kelompok 3: Ablation Study (Hari 2, setelah MTL-Full)
+
+Setiap ablation mengubah tepat satu komponen dari MTL-Full untuk mengisolasi kontribusinya. Semua hyperparameter lain identik dengan MTL-Full.
+
+#### Exp-ABL1: Frozen All Layers
+
+```
+Perubahan : semua 12 layer DNABERT dibekukan sepanjang training
+            hanya projection layer + Head 1 + Head 2 yang dilatih
+Pertanyaan: apakah fine-tuning layer akhir DNABERT memang memberikan perbedaan?
+Ekspektasi: performa lebih rendah dari MTL-Full, terutama pada task yang
+            distribusi sekuensnya berbeda dari pretraining DNABERT
+Estimasi  : ~15-20 menit per fold (lebih cepat karena gradient tidak melewati DNABERT)
+```
+
+#### Exp-ABL2: Unfreeze All Layers
+
+```
+Perubahan : semua 12 layer DNABERT di-fine-tune dari epoch 6 seterusnya
+            (bukan hanya layer 9-12)
+LR        : DNABERT layer 1-8 = 1e-6 (sangat kecil)
+            DNABERT layer 9-12 = 1e-5
+            projection + heads = 1e-4
+Pertanyaan: apakah fine-tuning terlalu dalam malah merugikan
+            (catastrophic forgetting dari pengetahuan DNA umum)?
+Ekspektasi: mungkin lebih buruk dari MTL-Full pada off-target karena dataset kecil
+            lebih rentan overfitting ketika encoder berubah terlalu banyak
+Estimasi  : ~35-50 menit per fold (gradient melewati semua layer)
+```
+
+#### Exp-ABL3: Combined Loss
+
+```
+Perubahan : ganti alternating batch training dengan combined loss
+            pada setiap step, KEDUA loss dihitung dan dijumlahkan:
+            L_total = 0.5 * L_on + 0.5 * L_off
+            Kedua dataset di-sample secara bersamaan dalam satu batch gabungan
+Pertanyaan: apakah strategi alternating lebih baik dari combined loss?
+            apakah perbedaan skala antara MSE dan BCE menjadi masalah?
+Ekspektasi: combined loss mungkin tidak stabil karena skala MSE (biasanya 0.01-0.1)
+            dan skala BCE (biasanya 0.3-0.7) berbeda jauh, menyebabkan salah satu
+            task mendominasi gradient update
+Estimasi  : ~30-45 menit per fold
+```
+
+---
+
+### Eksperimen Tambahan: Interpretability Analysis (Hari 3)
+
+Ini bukan eksperimen training baru, melainkan analisis post-hoc menggunakan checkpoint terbaik dari MTL-Full.
+
+#### Exp-IG: Integrated Gradients Comparative Analysis
+
+```
+Tujuan    : mengidentifikasi posisi nukleotida paling penting menurut
+            masing-masing head, dan membandingkan keduanya secara berdampingan
+
+Setup     :
+  Model   : checkpoint MTL-Full terbaik (fold dengan performa tertinggi)
+  Library : Captum (torch.hub)
+  Baseline: embedding vektor nol (zero embedding) untuk semua token
+
+Sampel analisis:
+  Untuk Head 1 (On-Target):
+    - 10 gRNA dengan prediksi efficiency TINGGI (top 10 dari val set)
+    - 10 gRNA dengan prediksi efficiency RENDAH (bottom 10 dari val set)
+  Untuk Head 2 (Off-Target):
+    - 10 pasangan gRNA-DNA dengan prediksi off-target aktif TINGGI
+    - 10 pasangan dengan prediksi off-target aktif RENDAH
+
+Komputasi :
+  Jumlah langkah integral : 50 (Riemann approximation)
+  Agregasi token ke nukleotida:
+    score_posisi_i = sum(|IG_j|) untuk semua token j yang mengandung nukleotida i
+    kemudian dinormalisasi sehingga total = 1.0
+
+Output    :
+  1. Bar chart saliency per posisi (1-23) untuk Head 1, rata-rata dari 20 sampel
+  2. Bar chart saliency per posisi (1-23) untuk Head 2, rata-rata dari 20 sampel
+  3. Side-by-side comparison plot antara Head 1 dan Head 2
+  4. Highlight otomatis pada seed region (posisi 12-20 dari ujung 5')
+
+Validasi biologis:
+  Cek apakah posisi 12-20 (seed region) mendominasi saliency Head 2 (off-target)
+  Bandingkan distribusi kepentingan Head 1 vs Head 2:
+    - Jika Head 2 lebih terkonsentrasi pada seed region → hipotesis biologis terkonfirmasi
+    - Jika keduanya mirip → menunjukkan shared mechanism yang kuat
+
+Estimasi  : ~30-60 menit total (tidak butuh GPU besar, hanya inference + gradient)
+```
+
+---
+
+### Ringkasan Semua Run
+
+| ID | Model | Task | Data | Metrik | Estimasi/Fold |
+|---|---|---|---|---|---|
+| A1 | BiLSTM scratch | On-target | Doench+DeepHF | Spearman, Pearson | 5-10 mnt |
+| A2 | CNN-BiLSTM scratch | Off-target | GUIDE-seq+dll | AUROC, AUPR | 5-10 mnt |
+| B1 | DNABERT single-task | On-target | Doench+DeepHF | Spearman, Pearson | 15-25 mnt |
+| B2 | DNABERT single-task | Off-target | GUIDE-seq+dll | AUROC, AUPR | 15-25 mnt |
+| MTL-Full | CRISPR-MTL | Both | Both | Spearman + AUROC/AUPR | 30-45 mnt |
+| ABL1 | MTL frozen all | Both | Both | Spearman + AUROC/AUPR | 15-20 mnt |
+| ABL2 | MTL unfreeze all | Both | Both | Spearman + AUROC/AUPR | 35-50 mnt |
+| ABL3 | MTL combined loss | Both | Both | Spearman + AUROC/AUPR | 30-45 mnt |
+| IG | Interpretability | Post-hoc | 40 sampel | Saliency visualization | 30-60 mnt total |
+
+**Total estimasi GPU time:** ~15-20 jam untuk semua 8 run lengkap dengan 5-fold CV di Kaggle P100/Colab T4.
+
+### Hyperparameter Standar Semua Eksperimen
+
+Untuk memastikan perbandingan yang adil, berikut adalah hyperparameter yang dibuat konsisten di seluruh eksperimen kecuali disebutkan sebaliknya.
+
+| Hyperparameter | Nilai |
+|---|---|
+| Batch size | 32 (on-target), 16 (off-target, karena dataset lebih kecil) |
+| Optimizer | AdamW |
+| Weight decay | 1e-2 |
+| Gradient clipping | max_norm = 1.0 |
+| Cross-validation | 5-fold stratified |
+| Random seed | 42 (semua eksperimen) |
+| Mixed precision | fp16 (aktifkan jika GPU mendukung) |
+| Checkpoint metric | rata-rata Spearman + AUROC yang dinormalisasi |
 
 ### Metrik Evaluasi
 
-Untuk **on-target head**, metrik utama adalah **Spearman Rank Correlation Coefficient** antara prediksi model dan nilai indel frequency eksperimental. Pearson correlation dilaporkan sebagai metrik sekunder.
+Untuk **on-target head**, metrik utama adalah **Spearman Rank Correlation Coefficient** antara prediksi model dan nilai indel frequency eksperimental. Spearman dipilih karena mengukur korelasi urutan peringkat yang lebih relevan secara praktis: peneliti ingin mengetahui gRNA mana yang relatif lebih efisien. Pearson correlation dilaporkan sebagai metrik sekunder.
 
-Untuk **off-target head**, dua metrik digunakan bersama. **AUROC** mengukur kemampuan model membedakan off-target aktif dari non-aktif. **AUPR** lebih informatif untuk dataset imbalanced karena langsung mengukur performa pada kelas minoritas yang paling penting secara klinis.
+Untuk **off-target head**, dua metrik digunakan bersama. **AUROC** mengukur kemampuan model membedakan off-target aktif dari non-aktif pada berbagai threshold. **AUPR** lebih informatif untuk dataset imbalanced karena langsung mengukur performa pada kelas minoritas yang secara klinis paling penting.
 
-Semua eksperimen menggunakan **5-fold cross-validation** dengan stratified sampling dan melaporkan rata-rata serta standar deviasi di seluruh fold.
+### Device Requirements dan Rekomendasi
+
+Karena DNABERT adalah model ~110 juta parameter namun dengan input yang sangat pendek (maksimal 38 token), kebutuhan komputasi jauh lebih ringan dibanding fine-tuning LLM teks biasa.
+
+| Device | Status | Estimasi Total Semua Run |
+|---|---|---|
+| Kaggle P100 (16GB VRAM) | Direkomendasikan | ~15-20 jam |
+| Google Colab T4 (15GB VRAM) | Cukup, risiko disconnect | ~18-25 jam |
+| Local GPU RTX 3060+ (8GB VRAM) | Ideal jika tersedia | ~10-15 jam |
+| CPU saja | Tidak direkomendasikan | 80+ jam |
+
+Rekomendasi utama adalah **Kaggle** sebagai environment primer karena tidak ada session timeout dan limit 30 jam GPU per minggu sudah lebih dari cukup. Wajib menyimpan checkpoint setelah setiap fold selesai untuk mencegah kehilangan progress.
 
 ---
 
