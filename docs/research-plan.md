@@ -150,15 +150,40 @@ Tujuan keempat adalah mengimplementasikan prototipe aplikasi prediksi berbasis G
 
 ### Dataset
 
-**Dataset On-Target (untuk Head 1):**
+Penelitian ini menggunakan tiga dataset yang semuanya bersumber dari repository publik dan sudah tersedia secara lokal dalam struktur folder `data/` proyek ini. Tiga dataset ini dipilih karena merupakan benchmark yang paling banyak dirujuk dalam literatur CRISPR prediction, sekaligus mewakili dua eksperimen yang berbeda secara teknis (on-target efficiency measurement dan off-target cleavage detection).
 
-Dataset utama yang digunakan adalah **Doench 2016 dataset** (Doench et al., Nature Biotechnology, 2016). Dataset ini berisi 5.310 guide sequence dengan label indel frequency hasil eksperimen high-throughput menggunakan plasmid library yang diekspresikan dalam sel manusia, dan telah menjadi standar benchmark di bidang ini selama hampir satu dekade. Sebagai dataset pelengkap, data dari **DeepHF** (Wang et al., 2019) juga diintegrasikan untuk memperbesar corpus training menjadi sekitar 8.000 hingga 10.000 sampel berlabel.
+```
+data/
+├── on-target/
+│   └── Supplementary File1.csv       ← Doench 2016 (on-target)
+└── off-target/
+    ├── eg_cls_off_target.epiotrt      ← DeepCRISPR off-target benchmark
+    └── listgarten_elevation_hmg.pkl   ← Listgarten GUIDE-seq off-target
+```
 
-Sumber download: Dataset Doench 2016 tersedia di `https://github.com/khaled-buet/CRISPRpred`. Dataset DeepHF tersedia di repository GitHub resmi DeepHF.
+**Dataset 1 — On-Target: Doench 2016**
 
-**Dataset Off-Target (untuk Head 2):**
+File: `data/on-target/Supplementary File1.csv`
 
-Dataset off-target yang digunakan berasal dari repository `https://github.com/dagrate/public_data_crisprCas9` yang mengumpulkan data benchmark dalam format yang sudah di-encode, mencakup data dari GUIDE-seq (Listgarten et al.), CIRCLE-seq (Tsai et al.), SITE-seq (Cameron et al.), dan Digenome-seq. Setiap sampel adalah pasangan gRNA-DNA dengan label biner (1 jika terjadi off-target cleavage, 0 jika tidak). Dataset ini secara inheren sangat imbalanced dan ditangani melalui class weighting dalam fungsi loss. Kedua dataset tidak memiliki sampel yang overlap, sehingga ditangani melalui strategi alternating batch training.
+Dataset ini dipublikasikan oleh Doench et al. dalam paper *"Optimized sgRNA design to maximize activity and minimize off-target effects of CRISPR-Cas9"* (Nature Biotechnology, 2016) dan bersumber dari repository CRISPRpred (`https://github.com/khaled-buet/CRISPRpred`). Dataset berisi 5.310 guide sequence dari 17 gen yang diuji dalam sel manusia menggunakan plasmid library high-throughput. Kolom yang digunakan adalah `30mer` sebagai sekuens input dan `predictions` sebagai label efisiensi (nilai kontinu 0-1 yang merepresentasikan normalized indel frequency). Dataset ini telah menjadi standar benchmark on-target prediction selama hampir satu dekade dan digunakan oleh hampir semua paper CRISPR on-target yang ada.
+
+Preprocessing: dari kolom `30mer` (30 nukleotida), diambil 23 karakter mulai posisi indeks 4 hingga 27 untuk mendapatkan 20 nt gRNA beserta 3 nt PAM sequence yang diperlukan oleh DNABERT tokenizer.
+
+**Dataset 2 — Off-Target: DeepCRISPR Benchmark**
+
+File: `data/off-target/eg_cls_off_target.epiotrt`
+
+Dataset ini bersumber dari repository `dagrate/public_data_crisprCas9` dan merupakan kumpulan data benchmark off-target yang digunakan dalam paper DeepCRISPR (Chuai et al., 2018). File disimpan dalam format serialized object (pickle-compatible) dan berisi pasangan sgRNA-DNA beserta label biner (1 = terjadi off-target cleavage, 0 = tidak ada cleavage). Dataset ini mengumpulkan data dari beberapa sumber eksperimental termasuk GUIDE-seq dan CIRCLE-seq, dikompilasi dalam satu format yang konsisten.
+
+**Dataset 3 — Off-Target: Listgarten Elevation GUIDE-seq**
+
+File: `data/off-target/listgarten_elevation_hmg.pkl`
+
+Dataset ini bersumber dari paper Listgarten et al. *"Prediction of off-target activities for the end-to-end design of CRISPR guide RNAs"* (Nature Biomedical Engineering, 2018) dan tersedia dalam format sklearn Bunch object. Dataset ini mengandung data GUIDE-seq dari eksperimen sel manusia yang mengukur aktivitas pemotongan Cas9 secara genome-wide untuk serangkaian sgRNA. Dalam konteks penelitian ini, dataset Listgarten digunakan sebagai sumber data off-target sekunder yang melengkapi Dataset 2 dan memperkaya distribusi sgRNA yang dilihat oleh model selama training.
+
+**Catatan penting tentang struktur data off-target:**
+
+Kedua dataset off-target (Dataset 2 dan Dataset 3) digabungkan setelah melalui preprocessing standarisasi format, kemudian digunakan bersama-sama sebagai satu corpus off-target training. Penggabungan dilakukan dengan deduplikasi berdasarkan pasangan sekuens gRNA-DNA untuk menghindari data leakage antar fold dalam cross-validation. Dataset off-target secara inheren sangat imbalanced karena jumlah off-target sites aktif (label 1) jauh lebih sedikit dibanding total candidate sites yang diuji. Kondisi ini ditangani melalui class weighting pada fungsi BCE loss dengan `w_pos = n_negatif / n_positif`. Ketiga dataset tidak memiliki sampel yang overlap antara on-target dan off-target, sehingga ditangani melalui strategi alternating batch training yang dijelaskan pada bagian berikutnya.
 
 ### Model SoTA yang Diadaptasi: DNABERT
 
@@ -335,7 +360,7 @@ Arsitektur: Linear(4→32) → BiLSTM(hidden=128, layers=2, bidirectional=True)
             → Linear(64→1) → Sigmoid
 Task      : Regression
 Loss      : MSE
-Dataset   : Doench 2016 + DeepHF (~8.000-10.000 sampel)
+Dataset   : Doench 2016 — Supplementary File1.csv (5.310 sampel)
 Split     : 5-fold cross-validation (80% train, 20% val per fold)
 Optimizer : Adam, lr=1e-3
 Epochs    : 50 (dengan early stopping patience=10)
@@ -355,7 +380,8 @@ Arsitektur: Conv1D(in=7, out=64, kernel=3) → ReLU → MaxPool
             → Linear(64→1) → Sigmoid
 Task      : Binary Classification
 Loss      : BCE dengan class weighting (w_pos = n_neg/n_pos)
-Dataset   : GUIDE-seq + CIRCLE-seq + SITE-seq + Digenome-seq
+Dataset   : DeepCRISPR benchmark (eg_cls_off_target.epiotrt) +
+            Listgarten GUIDE-seq (listgarten_elevation_hmg.pkl), digabung
 Split     : 5-fold stratified cross-validation
 Optimizer : Adam, lr=1e-3
 Epochs    : 50 (dengan early stopping patience=10)
@@ -559,15 +585,15 @@ Estimasi  : ~30-60 menit total (tidak butuh GPU besar, hanya inference + gradien
 
 | ID | Model | Task | Data | Metrik | Estimasi/Fold |
 |---|---|---|---|---|---|
-| A1 | BiLSTM scratch | On-target | Doench+DeepHF | Spearman, Pearson | 5-10 mnt |
-| A2 | CNN-BiLSTM scratch | Off-target | GUIDE-seq+dll | AUROC, AUPR | 5-10 mnt |
-| B1 | DNABERT single-task | On-target | Doench+DeepHF | Spearman, Pearson | 15-25 mnt |
-| B2 | DNABERT single-task | Off-target | GUIDE-seq+dll | AUROC, AUPR | 15-25 mnt |
-| MTL-Full | CRISPR-MTL | Both | Both | Spearman + AUROC/AUPR | 30-45 mnt |
-| ABL1 | MTL frozen all | Both | Both | Spearman + AUROC/AUPR | 15-20 mnt |
-| ABL2 | MTL unfreeze all | Both | Both | Spearman + AUROC/AUPR | 35-50 mnt |
-| ABL3 | MTL combined loss | Both | Both | Spearman + AUROC/AUPR | 30-45 mnt |
-| IG | Interpretability | Post-hoc | 40 sampel | Saliency visualization | 30-60 mnt total |
+| A1 | BiLSTM scratch | On-target | Doench 2016 (5.310 sampel) | Spearman, Pearson | 5-10 mnt |
+| A2 | CNN-BiLSTM scratch | Off-target | DeepCRISPR + Listgarten (gabungan) | AUROC, AUPR | 5-10 mnt |
+| B1 | DNABERT single-task | On-target | Doench 2016 (5.310 sampel) | Spearman, Pearson | 15-25 mnt |
+| B2 | DNABERT single-task | Off-target | DeepCRISPR + Listgarten (gabungan) | AUROC, AUPR | 15-25 mnt |
+| MTL-Full | CRISPR-MTL | Both | Semua 3 dataset | Spearman + AUROC/AUPR | 30-45 mnt |
+| ABL1 | MTL frozen all | Both | Semua 3 dataset | Spearman + AUROC/AUPR | 15-20 mnt |
+| ABL2 | MTL unfreeze all | Both | Semua 3 dataset | Spearman + AUROC/AUPR | 35-50 mnt |
+| ABL3 | MTL combined loss | Both | Semua 3 dataset | Spearman + AUROC/AUPR | 30-45 mnt |
+| IG | Interpretability | Post-hoc | 40 sampel dari val set | Saliency visualization | 30-60 mnt total |
 
 **Total estimasi GPU time:** ~15-20 jam untuk semua 8 run lengkap dengan 5-fold CV di Kaggle P100/Colab T4.
 
