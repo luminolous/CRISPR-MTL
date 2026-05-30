@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import pandas.compat.pickle_compat as pc
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedGroupKFold
 
 # torch is imported lazily inside Dataset classes so this module can be loaded
 # in environments where PyTorch DLLs may not be available (e.g. local Windows dev).
@@ -27,9 +27,17 @@ logger = logging.getLogger(__name__)
 # ─── Pandas 2.x compatibility patch for old BlockManager pickles ──────────────
 
 def _patch_pickle_compat() -> None:
-    """Patch pandas Unpickler to handle BlockManager from pandas < 2.0 pickles."""
-    from pandas.core.internals import BlockManager
+    """Patch pandas Unpickler for full compatibility with old pandas pickles.
 
+    Handles two issues:
+    1. BlockManager reconstruction fails on pandas >= 2.0 (TypeError)
+    2. 'pandas.indexes.*' module paths no longer exist (moved to
+       'pandas.core.indexes.*' in pandas 0.20+), causing ModuleNotFoundError.
+    """
+    from pandas.core.internals import BlockManager
+    import importlib
+
+    # ── Patch 1: load_reduce — fix BlockManager __new__ ──────────────────────
     def _load_reduce(self) -> None:
         stack = self.stack
         args = stack.pop()
@@ -50,8 +58,37 @@ def _patch_pickle_compat() -> None:
                     pass
             raise
 
+    # ── Patch 2: find_class — remap old pandas.indexes.* module paths ─────────
+    _orig_find_class = pc.Unpickler.find_class
+
+    def _find_class(self, module: str, name: str):
+        # pandas.indexes.* was renamed to pandas.core.indexes.* in pandas 0.20
+        if module.startswith("pandas.indexes"):
+            module = module.replace("pandas.indexes", "pandas.core.indexes", 1)
+        # pandas.core.common.Index etc. — remap to core.indexes.base
+        try:
+            return _orig_find_class(self, module, name)
+        except (ModuleNotFoundError, AttributeError, ImportError):
+            # Fallback: search common pandas index locations
+            for fallback_mod in (
+                "pandas.core.indexes.base",
+                "pandas.core.indexes.range",
+                "pandas.core.indexes.multi",
+                "pandas.core.frame",
+                "pandas.core.series",
+            ):
+                try:
+                    mod = importlib.import_module(fallback_mod)
+                    if hasattr(mod, name):
+                        return getattr(mod, name)
+                except (ImportError, AttributeError):
+                    continue
+            # Re-raise original error if all fallbacks exhausted
+            return _orig_find_class(self, module, name)
+
     pc.Unpickler.dispatch = copy.copy(pc.Unpickler.dispatch)
     pc.Unpickler.dispatch[pkl.REDUCE[0]] = _load_reduce
+    pc.Unpickler.find_class = _find_class
 
 
 _patch_pickle_compat()
@@ -124,8 +161,9 @@ def load_offtarget(dc_path: Path, lg_path: Path) -> Dict:
 
     # --- Listgarten: pandas < 2.0 pickle, requires compat patch + latin-1 ---
     # col '30mer' = gRNA (23mer), '30mer_mut' = dna_target (23mer), 'wasValidated' = label
+    # Use Unpickler directly — pc.load() is absent in some pandas versions.
     with open(lg_path, "rb") as f:
-        lg_raw = pc.load(f, encoding="latin-1")
+        lg_raw = pc.Unpickler(f, encoding="latin-1").load()
     df_lg = pd.DataFrame({
         "grna":       lg_raw["30mer"].astype(str),
         "dna_target": lg_raw["30mer_mut"].astype(str),
@@ -239,23 +277,27 @@ def create_cv_splits(
     """Create n-fold CV splits and save to disk.
 
     On-target: KFold (balanced classes).
-    Off-target: StratifiedKFold (only ~53 positives — stratification is critical).
+    Off-target: StratifiedGroupKFold grouped by gRNA — prevents the same gRNA
+    leaking across train/val (one gRNA spans many rows) while keeping the
+    positive class balanced across folds (~53 positives total).
 
     Returns dict: fold_idx → {train_on, val_on, train_off, val_off} index lists.
     """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    kf_on  = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    skf_off = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    kf_on   = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    sgkf_off = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
-    on_idx   = np.arange(len(df_on))
-    off_idx  = np.arange(len(df_off))
+    on_idx     = np.arange(len(df_on))
+    off_idx    = np.arange(len(df_off))
     off_labels = df_off["label"].values
+    off_groups = df_off["grna"].values   # group by gRNA → no leakage
 
     splits: Dict = {}
     for fold, ((tr_on, val_on), (tr_off, val_off)) in enumerate(
-        zip(kf_on.split(on_idx), skf_off.split(off_idx, off_labels))
+        zip(kf_on.split(on_idx),
+            sgkf_off.split(off_idx, off_labels, groups=off_groups))
     ):
         splits[fold] = {
             "train_on":  on_idx[tr_on].tolist(),

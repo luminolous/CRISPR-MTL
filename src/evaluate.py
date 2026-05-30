@@ -121,9 +121,11 @@ def compute_integrated_gradients(
 ) -> Dict:
     """Compute per-nucleotide importance via Integrated Gradients on DNABERT embeddings.
 
-    Uses captum.attr.IntegratedGradients on the word embedding layer.
-    Aggregates k-mer token attributions back to nucleotide positions
-    (sum absolute IG across overlapping 6-mer tokens, then L1-normalize).
+    Uses captum.attr.LayerIntegratedGradients on the full BertEmbeddings layer
+    (word + position + token_type + LayerNorm), so attributions match the real
+    forward path of the trained model. Aggregates k-mer token attributions back
+    to nucleotide positions (sum absolute IG across overlapping 6-mer tokens,
+    then L1-normalize).
 
     Args:
         model:       CRISPRMultiTask (eval mode)
@@ -139,38 +141,25 @@ def compute_integrated_gradients(
             'head2_importance': np.array shape (23,) — per-nucleotide importance for Head 2
     """
     try:
-        from captum.attr import IntegratedGradients
+        from captum.attr import LayerIntegratedGradients
     except ImportError:
         raise ImportError("captum is required for IG analysis. pip install captum")
 
     import torch
-    from src.dataset import seq_to_kmer
+    from dataset import seq_to_kmer
 
     model = model.to(device)
     model.eval()
 
-    def _get_embedding_fn(task: str):
-        """Return a forward function that takes embeddings as input."""
-        def forward_from_embeddings(embeddings: "torch.Tensor") -> "torch.Tensor":
-            # embeddings: (batch, seq_len, hidden)
-            # Bypass the embedding layer, feed directly into encoder
-            attention_mask = torch.ones(
-                embeddings.shape[0], embeddings.shape[1],
-                dtype=torch.long, device=device
-            )
-            enc_out = model.bert.encoder(
-                embeddings,
-                attention_mask=model.bert.get_extended_attention_mask(
-                    attention_mask, embeddings.shape[:2]
-                ),
-            )
-            cls = enc_out.last_hidden_state[:, 0, :]
-            x = model.projection(cls)
-            return model.head_ontarget(x) if task == "ontarget" else model.head_offtarget(x)
-        return forward_from_embeddings
+    def _make_forward(task: str):
+        """Forward through the real model; LayerIG hooks the embedding layer."""
+        def fwd(input_ids, attention_mask, token_type_ids=None):
+            return model(input_ids, attention_mask, task=task,
+                         token_type_ids=token_type_ids)  # (batch, 1)
+        return fwd
 
     def _run_ig(seqs_a: List[str], seqs_b: Optional[List[str]], task: str) -> np.ndarray:
-        """Run IG and return per-position attribution array of shape (23,)."""
+        """Run LayerIG and return per-position attribution array of shape (23,)."""
         k = 6
         if seqs_b is None:
             enc = tokenizer(
@@ -185,17 +174,19 @@ def compute_integrated_gradients(
                 padding="max_length", max_length=50,
                 truncation=True, return_tensors="pt"
             )
-        input_ids = enc["input_ids"].to(device)
+        input_ids      = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+        ttids          = enc.get("token_type_ids")
+        ttids          = ttids.to(device) if ttids is not None else None
+        baseline_ids   = torch.zeros_like(input_ids)  # all-[PAD]/zero baseline
 
-        embeddings = model.bert.embeddings.word_embeddings(input_ids)
-        baseline   = torch.zeros_like(embeddings)
-
-        ig = IntegratedGradients(_get_embedding_fn(task))
-        attributions = ig.attribute(
-            embeddings,
-            baselines=baseline,
+        lig = LayerIntegratedGradients(_make_forward(task), model.bert.embeddings)
+        attributions = lig.attribute(
+            inputs=input_ids,
+            baselines=baseline_ids,
+            additional_forward_args=(attention_mask, ttids),
+            target=0,
             n_steps=n_steps,
-            return_convergence_delta=False,
         )  # (batch, seq_len, hidden)
 
         # Aggregate: sum abs attributions over hidden dim → (batch, seq_len)
@@ -203,8 +194,7 @@ def compute_integrated_gradients(
         mean_attr  = token_attr.mean(0)  # (seq_len,)
 
         # Map token positions back to nucleotide positions
-        # For on-target: [CLS]=0, tokens 1..18 are k-mers for positions 0..17
-        # Nucleotide i covered by k-mers max(0, i-k+1)..min(i, 17) → tokens +1 offset
+        # [CLS]=0, tokens 1..18 are k-mers for nucleotide positions 0..17
         n_nuc = 23
         nuc_attr = np.zeros(n_nuc)
         for t_idx in range(1, 1 + (n_nuc - k + 1)):  # tokens 1..18

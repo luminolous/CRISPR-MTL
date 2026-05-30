@@ -7,6 +7,7 @@ Multi-task:  MTL-Full, ABL1, ABL2, ABL3
 import copy
 import logging
 import pickle as pkl
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -18,8 +19,6 @@ import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
-
 from evaluate import compute_metrics_offtarget, compute_metrics_ontarget
 from model import (
     BiLSTMBaseline,
@@ -37,6 +36,95 @@ _RESULTS_DIR = _ROOT / "outputs" / "results"
 
 for _d in (_CKPT_DIR, _RESULTS_DIR, _ROOT / "outputs" / "figures"):
     _d.mkdir(parents=True, exist_ok=True)
+
+
+# ─── Reproducibility ───────────────────────────────────────────────────────────
+
+def set_seed(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs for reproducible runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ─── Experiment descriptions ───────────────────────────────────────────────────
+
+_EXP_DESC: Dict[str, str] = {
+    "A1":       "BiLSTM | On-Target | from scratch",
+    "A2":       "CNN-BiLSTM | Off-Target | from scratch",
+    "B1":       "DNABERT Single-Task | On-Target",
+    "B2":       "DNABERT Single-Task | Off-Target",
+    "MTL-Full": "CRISPR-MTL | Multi-Task | full model",
+    "ABL1":     "Ablation 1 | MTL, all DNABERT frozen",
+    "ABL2":     "Ablation 2 | MTL, all DNABERT fine-tuned",
+    "ABL3":     "Ablation 3 | MTL, combined loss",
+}
+
+_W = 62  # display width
+
+
+# ─── Print helpers (notebook-friendly) ────────────────────────────────────────
+
+def _hr(char: str = "=") -> str:
+    return char * _W
+
+
+def _fmt_metrics(metrics: Dict) -> str:
+    return "  ".join(f"{k} {v:.4f}" for k, v in metrics.items() if not np.isnan(v))
+
+
+def _print_exp_header(exp_id: str, n_folds: int, device: torch.device) -> None:
+    desc = _EXP_DESC.get(exp_id, exp_id)
+    print(f"\n{_hr()}")
+    print(f"  {exp_id}  |  {desc}")
+    print(f"  {n_folds}-fold CV  |  device: {device}")
+    print(_hr())
+
+
+def _print_fold_header(fold: int, n_folds: int) -> None:
+    label = f"  Fold {fold + 1}/{n_folds} "
+    print(f"\n{label}{'-' * (_W - len(label))}")
+
+
+def _print_epoch(epoch: int, total: int, loss: float, metrics: Dict, is_best: bool) -> None:
+    star = "  <best>" if is_best else ""
+    print(f"  Ep {epoch:3d}/{total}  |  loss {loss:.4f}  |  {_fmt_metrics(metrics)}{star}",
+          flush=True)
+
+
+def _print_phase(msg: str) -> None:
+    print(f"  ----  {msg}")
+
+
+def _print_fold_result(fold: int, best_epoch: int, metrics: Dict) -> None:
+    print(f"  {'-' * _W}")
+    print(f"  [OK] Fold {fold + 1}  (best ep {best_epoch})  {_fmt_metrics(metrics)}")
+
+
+def _print_skip(fold: int, n_folds: int) -> None:
+    print(f"\n  Fold {fold + 1}/{n_folds}  [checkpoint exists -- skipping]")
+
+
+def _print_early_stop(epoch: int, best_epoch: int) -> None:
+    print(f"  ----  Early stop at ep {epoch}  (best was ep {best_epoch})")
+
+
+def _print_summary(exp_id: str, metrics_list: List[Dict]) -> None:
+    print(f"\n{_hr()}")
+    print(f"  {exp_id}  |  {len(metrics_list)}-fold Summary")
+    print(f"  {'-' * (_W - 2)}")
+    all_keys: List[str] = []
+    for m in metrics_list:
+        for k in m:
+            if k not in all_keys:
+                all_keys.append(k)
+    for k in all_keys:
+        vals = [m[k] for m in metrics_list if k in m and not np.isnan(m.get(k, float("nan")))]
+        if vals:
+            print(f"  {k:12s}:  {np.mean(vals):.4f} +/- {np.std(vals):.4f}")
+    print(_hr())
 
 
 # ─── DNA encoding utilities (for baseline models) ─────────────────────────────
@@ -155,18 +243,30 @@ def train_epoch_single(
     loss_fn,
     device: torch.device,
     task: Optional[str] = None,
+    scaler: Optional["torch.amp.GradScaler"] = None,
+    use_amp: bool = False,
 ) -> float:
-    """Train one epoch for a single-task model. Returns mean loss."""
+    """Train one epoch for a single-task model. Returns mean loss.
+
+    Mixed precision (fp16) is used when use_amp=True (CUDA only). Loss is
+    computed in fp32 outside autocast because F.binary_cross_entropy is unsafe
+    under autocast.
+    """
+    if scaler is None:
+        scaler = torch.amp.GradScaler(device.type, enabled=False)
     model.train()
     losses: List[float] = []
-    for batch in tqdm(loader, desc="  train", leave=False):
+    for batch in loader:
         batch = _to_device(batch, device)
-        pred  = _forward(model, batch, task=task).squeeze(-1)
-        loss  = loss_fn(pred, batch["label"])
         optimizer.zero_grad()
-        loss.backward()
+        with torch.amp.autocast(device.type, enabled=use_amp):
+            pred = _forward(model, batch, task=task).squeeze(-1)
+        loss = loss_fn(pred.float(), batch["label"])
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         losses.append(loss.item())
     return float(np.mean(losses))
 
@@ -229,15 +329,20 @@ def _append_result(row: Dict, csv_path: Path) -> None:
 
 
 def _combined_score(metrics: Dict) -> float:
-    """Compute combined score for checkpoint selection.
+    """Combined score for checkpoint selection, both metrics normalized to [0, 1].
 
-    0.5*(spearman+auroc) when both present; otherwise use the present metric.
+    spearman in [-1, 1] -> (s+1)/2 ; auroc already in [0, 1]. Mean of present parts.
+    For single-task this is monotonic in the lone metric (argmax unchanged); for
+    multi-task it puts both tasks on a comparable 0-1 scale before averaging.
     """
+    parts: List[float] = []
     s = metrics.get("spearman", None)
-    a = metrics.get("auroc",    None)
-    if s is not None and a is not None:
-        return 0.5 * (s + a)
-    return s if s is not None else (a if a is not None else 0.0)
+    a = metrics.get("auroc", None)
+    if s is not None and not np.isnan(s):
+        parts.append((s + 1.0) / 2.0)
+    if a is not None and not np.isnan(a):
+        parts.append(a)
+    return float(np.mean(parts)) if parts else 0.0
 
 
 # ─── Data loading helpers ─────────────────────────────────────────────────────
@@ -284,6 +389,7 @@ def train_single_task(
     _test_bert    : pre-built BertModel injected into B1/B2 (bypasses HF download)
     """
     assert exp_id in ("A1", "A2", "B1", "B2"), f"Unknown exp_id for single-task: {exp_id}"
+    device = torch.device(device) if isinstance(device, str) else device
 
     task     = "ontarget"  if exp_id in ("A1", "B1") else "offtarget"
     is_bert  = exp_id in ("B1", "B2")
@@ -312,16 +418,21 @@ def train_single_task(
     lr_bert       = config["dnabert_single"]["lr_dnabert"] if is_bert else None
     wd            = config["training"]["weight_decay"]
     w_pos         = min(off_meta["w_pos"], 50.0) if _test_loaders is None and not is_regression else None
+    use_amp       = bool(config["training"].get("use_fp16", False)) and device.type == "cuda"
 
     all_metrics: List[Dict] = []
     n_folds = len(splits)
 
+    _print_exp_header(exp_id, n_folds, device)
+
     for fold in range(n_folds):
         ckpt_path = ckpt_dir / f"{exp_id}_fold{fold}_best.pt"
         if ckpt_path.exists():
+            _print_skip(fold, n_folds)
             logger.info("Fold %d: checkpoint exists, skipping.", fold)
             continue
 
+        _print_fold_header(fold, n_folds)
         logger.info("=== %s | Fold %d/%d ===", exp_id, fold, n_folds - 1)
 
         # ── Build DataLoaders ──
@@ -391,6 +502,7 @@ def train_single_task(
         if is_bert:
             model.freeze_strategy("freeze_all")
         optimizer = _build_optimizer_phase1(model, lr_head, wd)
+        scaler    = torch.amp.GradScaler(device.type, enabled=use_amp)
 
         best_val   = -np.inf
         best_epoch = 0
@@ -400,21 +512,22 @@ def train_single_task(
         for epoch in range(1, epochs_total + 1):
             # Switch to Phase 2 after warmup
             if is_bert and epoch == warmup_epochs + 1:
-                logger.info("  Phase 2: unfreezing DNABERT layers 9-12")
+                _print_phase(f"Phase 2 (ep {epoch}): unfreeze DNABERT layers 9-12  |  lr_bert={lr_bert}")
+                logger.info("Phase 2: unfreezing DNABERT layers 9-12")
                 model.freeze_strategy("freeze_8")
                 optimizer = _build_optimizer_phase2(model, lr_head, lr_bert, wd)
 
-            train_loss = train_epoch_single(model, train_loader, optimizer, loss_fn, device, task=task)
+            train_loss  = train_epoch_single(model, train_loader, optimizer, loss_fn,
+                                              device, task=task, scaler=scaler, use_amp=use_amp)
             val_metrics = eval_epoch(model, val_loader, device, task)
-            combined = _combined_score(val_metrics)
+            combined    = _combined_score(val_metrics)
+            is_best     = combined > best_val + config["training"]["min_delta"]
 
-            logger.info(
-                "  Epoch %2d/%d | loss=%.4f | %s",
-                epoch, epochs_total, train_loss,
-                " | ".join(f"{k}={v:.4f}" for k, v in val_metrics.items()),
-            )
+            _print_epoch(epoch, epochs_total, train_loss, val_metrics, is_best)
+            logger.info("Ep %d/%d loss=%.4f %s", epoch, epochs_total, train_loss,
+                        _fmt_metrics(val_metrics))
 
-            if combined > best_val + config["training"]["min_delta"]:
+            if is_best:
                 best_val   = combined
                 best_epoch = epoch
                 no_improve = 0
@@ -432,7 +545,8 @@ def train_single_task(
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    logger.info("  Early stopping at epoch %d (best=%d)", epoch, best_epoch)
+                    _print_early_stop(epoch, best_epoch)
+                    logger.info("Early stopping at epoch %d (best=%d)", epoch, best_epoch)
                     break
 
         # ── Load best checkpoint for final metrics ──
@@ -442,23 +556,17 @@ def train_single_task(
         else:
             best_metrics = val_metrics  # fallback: last epoch
 
+        _print_fold_result(fold, best_epoch, best_metrics)
         row = {"exp_id": exp_id, "fold": fold}
         row.update({k: float("nan") for k in ("spearman", "pearson", "auroc", "aupr")})
         row.update(best_metrics)
         _append_result(row, csv_path)
         all_metrics.append(best_metrics)
-        logger.info("  Fold %d best: %s", fold, best_metrics)
+        logger.info("Fold %d best: %s", fold, best_metrics)
 
     # ── Summary ──
     if all_metrics:
-        primary = "spearman" if task == "ontarget" else "auroc"
-        vals = [m[primary] for m in all_metrics if primary in m]
-        if vals:
-            logger.info(
-                "%s done | %s: %.3f ± %.3f",
-                exp_id, primary, np.mean(vals), np.std(vals),
-            )
-            print(f"{exp_id} done | {primary}: {np.mean(vals):.3f} ± {np.std(vals):.3f}")
+        _print_summary(exp_id, all_metrics)
 
 
 # ─── train_multitask ──────────────────────────────────────────────────────────
@@ -478,6 +586,7 @@ def train_multitask(
     """
     assert exp_id in ("MTL-Full", "ABL1", "ABL2", "ABL3"), \
         f"Unknown exp_id for multitask: {exp_id}"
+    device = torch.device(device) if isinstance(device, str) else device
 
     ablation = config.get("ablation", {})
     use_combined_loss = (exp_id == "ABL3")
@@ -508,17 +617,24 @@ def train_multitask(
 
     w_pos = min(w_pos_raw, 50.0)
     mse_fn = nn.MSELoss()
+    use_amp = bool(config["training"].get("use_fp16", False)) and device.type == "cuda"
+    sched_factor   = cfg_mtl.get("scheduler_factor", 0.5)
+    sched_patience = cfg_mtl.get("scheduler_patience", 5)
 
     all_on_metrics:  List[Dict] = []
     all_off_metrics: List[Dict] = []
     n_folds = len(splits)
 
+    _print_exp_header(exp_id, n_folds, device)
+
     for fold in range(n_folds):
         ckpt_path = ckpt_dir / f"{exp_id}_fold{fold}_best.pt"
         if ckpt_path.exists():
+            _print_skip(fold, n_folds)
             logger.info("Fold %d: checkpoint exists, skipping.", fold)
             continue
 
+        _print_fold_header(fold, n_folds)
         logger.info("=== %s | Fold %d/%d ===", exp_id, fold, n_folds - 1)
 
         # ── Build DataLoaders ──
@@ -548,10 +664,12 @@ def train_multitask(
         bert  = copy.deepcopy(_test_bert) if _test_bert is not None else None
         model = CRISPRMultiTask(config, _bert=bert).to(device)
 
-        # ── Apply ABL1/ABL2 initial freeze ──
-        freeze_init = ablation.get("abl1_freeze_strategy", "freeze_8") if exp_id == "ABL1" else "freeze_8"
-        model.freeze_strategy(freeze_init)
+        # ── Phase 1 (warmup): ALL DNABERT frozen for every MTL variant ──
+        # (research-plan: epoch 1-5 = all frozen; ablations diverge only in Phase 2)
+        model.freeze_strategy("freeze_all")
         optimizer = _build_optimizer_phase1(model, lr_head, wd)
+        scaler    = torch.amp.GradScaler(device.type, enabled=use_amp)
+        scheduler = None  # ReduceLROnPlateau attached at Phase 2 transition
 
         best_combined = -np.inf
         best_epoch    = 0
@@ -564,39 +682,53 @@ def train_multitask(
             # ── Phase 2 transition ──
             if epoch == warmup_epochs + 1:
                 if exp_id == "ABL1":
-                    pass  # stay frozen
+                    _print_phase(f"Phase 2 (ep {epoch}): ABL1 - DNABERT stays fully frozen")
+                    # no optimizer rebuild, no scheduler (frozen encoder, static LR)
                 elif exp_id == "ABL2":
-                    logger.info("  ABL2 Phase 2: unfreeze all DNABERT layers")
+                    _print_phase(f"Phase 2 (ep {epoch}): ABL2 - unfreeze ALL DNABERT layers  |  lr={lr_bert_abl2}")
+                    logger.info("ABL2 Phase 2: unfreeze all DNABERT layers")
                     model.freeze_strategy("unfreeze_all")
                     optimizer = _build_optimizer_phase2(model, lr_head, lr_bert_abl2, wd)
+                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        optimizer, mode="max", factor=sched_factor, patience=sched_patience)
                 else:  # MTL-Full, ABL3
-                    logger.info("  Phase 2: unfreezing DNABERT layers 9-12")
+                    _print_phase(f"Phase 2 (ep {epoch}): unfreeze DNABERT layers 9-12  |  lr_bert={lr_bert}")
+                    logger.info("Phase 2: unfreezing DNABERT layers 9-12")
                     model.freeze_strategy("freeze_8")
                     optimizer = _build_optimizer_phase2(model, lr_head, lr_bert, wd)
+                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        optimizer, mode="max", factor=sched_factor, patience=sched_patience)
 
             # ── Training epoch ──
             if use_combined_loss:
                 ep_on_loss, ep_off_loss = _train_epoch_combined(
                     model, on_train, off_train, optimizer, mse_fn, w_pos, alpha, device,
+                    scaler=scaler, use_amp=use_amp,
                 )
             else:
                 ep_on_loss, ep_off_loss = _train_epoch_alternating(
                     model, on_train, off_train, optimizer, mse_fn, w_pos, device,
+                    scaler=scaler, use_amp=use_amp,
                 )
 
             # ── Validation ──
             on_metrics  = eval_epoch(model, on_val,  device, "ontarget")
             off_metrics = eval_epoch(model, off_val, device, "offtarget")
             combined    = _combined_score({**on_metrics, **off_metrics})
+            is_best     = combined > best_combined + config["training"]["min_delta"]
 
-            logger.info(
-                "  Epoch %2d/%d | on_loss=%.4f off_loss=%.4f | spearman=%.4f auroc=%.4f",
-                epoch, epochs_total, ep_on_loss, ep_off_loss,
-                on_metrics.get("spearman", float("nan")),
-                off_metrics.get("auroc",   float("nan")),
-            )
+            if scheduler is not None:
+                scheduler.step(combined)  # ReduceLROnPlateau on combined val score
 
-            if combined > best_combined + config["training"]["min_delta"]:
+            # Print epoch line: show both task metrics on one line
+            merged_metrics = {**on_metrics, **off_metrics}
+            _print_epoch(epoch, epochs_total, (ep_on_loss + ep_off_loss) / 2,
+                         merged_metrics, is_best)
+            logger.info("Ep %d/%d on_loss=%.4f off_loss=%.4f %s",
+                        epoch, epochs_total, ep_on_loss, ep_off_loss,
+                        _fmt_metrics(merged_metrics))
+
+            if is_best:
                 best_combined    = combined
                 best_epoch       = epoch
                 best_on_metrics  = on_metrics
@@ -617,14 +749,17 @@ def train_multitask(
             else:
                 no_improve += 1
                 if no_improve >= patience:
-                    logger.info("  Early stopping at epoch %d (best=%d)", epoch, best_epoch)
+                    _print_early_stop(epoch, best_epoch)
+                    logger.info("Early stopping at epoch %d (best=%d)", epoch, best_epoch)
                     break
 
-        # Use last epoch metrics if checkpoint wasn't saved (e.g., smoke test 2 epochs)
+        # Use last epoch metrics if checkpoint wasn't saved (smoke test with 2 epochs)
         if not best_on_metrics:
             best_on_metrics  = on_metrics
             best_off_metrics = off_metrics
 
+        best_all = {**best_on_metrics, **best_off_metrics}
+        _print_fold_result(fold, best_epoch, best_all)
         row = {"exp_id": exp_id, "fold": fold}
         row.update({k: float("nan") for k in ("spearman", "pearson", "auroc", "aupr")})
         row.update(best_on_metrics)
@@ -632,21 +767,12 @@ def train_multitask(
         _append_result(row, csv_path)
         all_on_metrics.append(best_on_metrics)
         all_off_metrics.append(best_off_metrics)
-        logger.info("  Fold %d best: on=%s | off=%s", fold, best_on_metrics, best_off_metrics)
+        logger.info("Fold %d best: on=%s | off=%s", fold, best_on_metrics, best_off_metrics)
 
     # ── Summary ──
     if all_on_metrics:
-        spear = [m.get("spearman", float("nan")) for m in all_on_metrics]
-        auroc = [m.get("auroc",    float("nan")) for m in all_off_metrics]
-        spear_v = [v for v in spear if not np.isnan(v)]
-        auroc_v = [v for v in auroc if not np.isnan(v)]
-        msg = f"{exp_id} done"
-        if spear_v:
-            msg += f" | Spearman: {np.mean(spear_v):.3f} ± {np.std(spear_v):.3f}"
-        if auroc_v:
-            msg += f" | AUROC: {np.mean(auroc_v):.3f} ± {np.std(auroc_v):.3f}"
-        logger.info(msg)
-        print(msg)
+        _print_summary(exp_id, [{**on, **off}
+                                 for on, off in zip(all_on_metrics, all_off_metrics)])
 
 
 # ─── Alternating / combined epoch helpers ─────────────────────────────────────
@@ -659,8 +785,12 @@ def _train_epoch_alternating(
     mse_fn: nn.MSELoss,
     w_pos: float,
     device: torch.device,
+    scaler: Optional["torch.amp.GradScaler"] = None,
+    use_amp: bool = False,
 ) -> Tuple[float, float]:
     """Alternating batch: one on-target step, one off-target step. Returns (on_loss, off_loss)."""
+    if scaler is None:
+        scaler = torch.amp.GradScaler(device.type, enabled=False)
     model.train()
     on_losses: List[float] = []
     off_losses: List[float] = []
@@ -668,7 +798,7 @@ def _train_epoch_alternating(
     off_iter = iter(off_loader)
     n_steps  = max(len(on_loader), len(off_loader))
 
-    for _ in tqdm(range(n_steps), desc="  train", leave=False):
+    for _ in range(n_steps):
         # On-target step
         try:
             ob = next(on_iter)
@@ -676,13 +806,16 @@ def _train_epoch_alternating(
             on_iter = iter(on_loader)
             ob = next(on_iter)
         ob = _to_device(ob, device)
-        on_pred = model(ob["input_ids"], ob["attention_mask"], task="ontarget",
-                        token_type_ids=ob.get("token_type_ids")).squeeze(-1)
-        on_loss = mse_fn(on_pred, ob["label"])
         optimizer.zero_grad()
-        on_loss.backward()
+        with torch.amp.autocast(device.type, enabled=use_amp):
+            on_pred = model(ob["input_ids"], ob["attention_mask"], task="ontarget",
+                            token_type_ids=ob.get("token_type_ids")).squeeze(-1)
+        on_loss = mse_fn(on_pred.float(), ob["label"])
+        scaler.scale(on_loss).backward()
+        scaler.unscale_(optimizer)
         clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         on_losses.append(on_loss.item())
 
         # Off-target step
@@ -692,13 +825,16 @@ def _train_epoch_alternating(
             off_iter = iter(off_loader)
             fb = next(off_iter)
         fb = _to_device(fb, device)
-        off_pred = model(fb["input_ids"], fb["attention_mask"], task="offtarget",
-                         token_type_ids=fb.get("token_type_ids")).squeeze(-1)
-        off_loss = _weighted_bce(off_pred, fb["label"], w_pos)
         optimizer.zero_grad()
-        off_loss.backward()
+        with torch.amp.autocast(device.type, enabled=use_amp):
+            off_pred = model(fb["input_ids"], fb["attention_mask"], task="offtarget",
+                             token_type_ids=fb.get("token_type_ids")).squeeze(-1)
+        off_loss = _weighted_bce(off_pred.float(), fb["label"], w_pos)
+        scaler.scale(off_loss).backward()
+        scaler.unscale_(optimizer)
         clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         off_losses.append(off_loss.item())
 
     return float(np.mean(on_losses)), float(np.mean(off_losses))
@@ -713,8 +849,12 @@ def _train_epoch_combined(
     w_pos: float,
     alpha: float,
     device: torch.device,
+    scaler: Optional["torch.amp.GradScaler"] = None,
+    use_amp: bool = False,
 ) -> Tuple[float, float]:
     """ABL3: combined loss L = alpha*L_on + (1-alpha)*L_off. Returns (on_loss, off_loss)."""
+    if scaler is None:
+        scaler = torch.amp.GradScaler(device.type, enabled=False)
     model.train()
     on_losses: List[float] = []
     off_losses: List[float] = []
@@ -722,7 +862,7 @@ def _train_epoch_combined(
     off_iter = iter(off_loader)
     n_steps  = max(len(on_loader), len(off_loader))
 
-    for _ in tqdm(range(n_steps), desc="  train", leave=False):
+    for _ in range(n_steps):
         try:
             ob = next(on_iter)
         except StopIteration:
@@ -737,19 +877,22 @@ def _train_epoch_combined(
         ob = _to_device(ob, device)
         fb = _to_device(fb, device)
 
-        on_pred  = model(ob["input_ids"], ob["attention_mask"], task="ontarget",
-                         token_type_ids=ob.get("token_type_ids")).squeeze(-1)
-        off_pred = model(fb["input_ids"], fb["attention_mask"], task="offtarget",
-                         token_type_ids=fb.get("token_type_ids")).squeeze(-1)
-
-        on_loss  = mse_fn(on_pred, ob["label"])
-        off_loss = _weighted_bce(off_pred, fb["label"], w_pos)
+        optimizer.zero_grad()
+        with torch.amp.autocast(device.type, enabled=use_amp):
+            on_pred  = model(ob["input_ids"], ob["attention_mask"], task="ontarget",
+                             token_type_ids=ob.get("token_type_ids")).squeeze(-1)
+            off_pred = model(fb["input_ids"], fb["attention_mask"], task="offtarget",
+                             token_type_ids=fb.get("token_type_ids")).squeeze(-1)
+        # Losses in fp32 (BCE unsafe under autocast)
+        on_loss  = mse_fn(on_pred.float(), ob["label"])
+        off_loss = _weighted_bce(off_pred.float(), fb["label"], w_pos)
         loss     = alpha * on_loss + (1.0 - alpha) * off_loss
 
-        optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         on_losses.append(on_loss.item())
         off_losses.append(off_loss.item())
 
@@ -771,7 +914,11 @@ def run_experiment(
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info("run_experiment: %s on %s", exp_id, device)
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    set_seed(config["training"]["seed"])  # reproducible model init, dropout, shuffle
+    logger.info("run_experiment: %s on %s (seed=%d)", exp_id, device, config["training"]["seed"])
 
     if exp_id in ("A1", "A2", "B1", "B2"):
         train_single_task(exp_id, config, device)

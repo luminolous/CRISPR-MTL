@@ -7,3 +7,4 @@ PROMPTS.md
 *\__pycache__
 \notebooks\experiment.py
 notebooks\
+outputs
