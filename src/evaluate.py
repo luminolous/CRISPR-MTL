@@ -118,6 +118,7 @@ def compute_integrated_gradients(
     samples_off: pd.DataFrame,
     n_steps: int = 50,
     device: str = "cpu",
+    internal_batch_size: int = 8,
 ) -> Dict:
     """Compute per-nucleotide importance via Integrated Gradients on DNABERT embeddings.
 
@@ -134,6 +135,10 @@ def compute_integrated_gradients(
         samples_off: DataFrame with column 'grna' and 'dna_target' (off-target)
         n_steps:     Riemann integration steps
         device:      'cpu' or 'cuda'
+        internal_batch_size: rows (samples x steps) processed per chunk. Keeps
+                     peak memory bounded — without it captum runs all
+                     n_samples*n_steps forward passes at once and can OOM /
+                     crash the kernel. Lower it (e.g. 4) if memory is tight.
 
     Returns:
         dict with:
@@ -187,6 +192,7 @@ def compute_integrated_gradients(
             additional_forward_args=(attention_mask, ttids),
             target=0,
             n_steps=n_steps,
+            internal_batch_size=internal_batch_size,  # chunk to bound memory
         )  # (batch, seq_len, hidden)
 
         # Aggregate: sum abs attributions over hidden dim → (batch, seq_len)

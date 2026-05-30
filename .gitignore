@@ -5,6 +5,7 @@ PROMPTS.md
 .venv
 
 *\__pycache__
-\notebooks\experiment.py
-notebooks\
-outputs
+*\checkpoints
+
+*\experiment-copy.ipynb
+*\fix.ipynb

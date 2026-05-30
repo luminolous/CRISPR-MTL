@@ -1,7 +1,4 @@
 # configs/config.yaml
-# Central configuration for CRISPR-MTL
-# All hyperparameters and paths are defined here.
-# Never hardcode values in src/ files — always reference this config.
 
 # PATHS
 paths:
