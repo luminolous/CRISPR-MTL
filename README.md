@@ -5,8 +5,8 @@ coupled properties of a CRISPR-Cas9 guide RNA at once: **on-target efficiency**
 (how well the guide cuts its intended site, a regression task) and **off-target
 activity** (whether the guide cuts unintended near-matching sites, a binary
 classification task). Prior work models these two problems with separate networks,
-yet both reflect the same underlying phenomenon — the strength and specificity of
-gRNA–DNA binding. This project tests whether a shared sequence representation,
+yet both reflect the same underlying phenomenon (the strength and specificity of
+gRNA–DNA binding). This project tests whether a shared sequence representation,
 learned jointly, benefits both tasks, and uses Integrated Gradients to compare what
 each task head attends to. It was built as a focused research sprint with full
 ablations and an honest accounting of where the approach helps and where data
